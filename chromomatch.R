@@ -2,18 +2,25 @@
 ###############################################################################
 # ChromoMatch
 #
-# Compares two autosomal raw DNA files and finds shared IBD
+# Compares two autosomal DNA samples and finds shared IBD
 # (identical-by-descent) segments reported in centimorgans (cM).
 #
-# Supports: 23andMe, AncestryDNA, FTDNA (Family Tree DNA)
+# Input sources:
+#   1. Raw DNA files from 23andMe, AncestryDNA, FTDNA
+#   2. PLINK binary datasets (.bed/.bim/.fam) — no external tools required
+#
 # Genetic maps: PLINK (.map), HapMap recombination maps, or auto-download
 # Reference build: GRCh37 / hg19 (default)
 #
-# Usage (command line):
+# Usage (command line — raw files):
 #   Rscript chromomatch.R <file1> <file2> [options]
 #
+# Usage (command line — PLINK dataset):
+#   Rscript chromomatch.R --bfile <prefix> --sample1 <ID> --sample2 <ID>
+#   Rscript chromomatch.R --bfile <prefix>          # interactive sample picker
+#
 # Usage (RStudio):
-#   Uncomment and set file1/file2 in the CONFIGURATION section below,
+#   Uncomment and set variables in the CONFIGURATION section below,
 #   then select all and click Run (or source the file).
 #
 # Options:
@@ -25,8 +32,11 @@
 #   --output <path>        Output CSV path (default: comparison_results.csv)
 #   --plot / --no-plot     Generate chromosome plot (default: yes)
 #   --plot-file <path>     Plot file path (default: comparison_plot.png)
+#   --bfile <prefix>       PLINK binary prefix (.bed/.bim/.fam)
+#   --sample1 <ID>         First sample IID (from .fam file)
+#   --sample2 <ID>         Second sample IID (from .fam file)
 #
-# License: MIT
+# License: GPL-3.0
 ###############################################################################
 
 # =============================================================================
@@ -44,10 +54,18 @@ suppressPackageStartupMessages({
 # CONFIGURATION (RStudio Interactive Mode)
 # =============================================================================
 # Uncomment and edit the file paths below to run interactively in RStudio.
-# All other settings are optional; defaults will be used if not set.
+# Use EITHER file1/file2 (raw DNA) OR bfile (PLINK). Not both.
 #
+# --- Raw DNA files ---
 # file1           <- "C:/path/to/person1_raw_dna.txt"
 # file2           <- "C:/path/to/person2_raw_dna.txt"
+#
+# --- PLINK dataset ---
+# bfile           <- "C:/path/to/plink_dataset"   # prefix for .bed/.bim/.fam
+# sample1         <- "SampleA"                     # IID from .fam (or leave
+# sample2         <- "SampleB"                     #   unset for interactive)
+#
+# --- Shared options ---
 # genetic_map_dir <- "./genetic_map_grch37"
 # min_cm          <- 7
 # min_snps        <- 500
@@ -69,7 +87,7 @@ defaults <- list(
   genetic_map_dir = NULL,    # NULL = attempt auto-download
   output_file     = "comparison_results.csv",
   plot            = TRUE,
-  plot_file       = "comparison_plot.png"
+  plot_file       = "comparison_plot.png",
 )
 
 # =============================================================================
@@ -77,49 +95,103 @@ defaults <- list(
 # =============================================================================
 
 args <- commandArgs(trailingOnly = TRUE)
+input_mode <- "none"   # will be set to "raw", "plink", or trigger usage
 
-if (length(args) >= 2) {
-  # ---- Command-line mode ----
-  file1 <- args[1]
-  file2 <- args[2]
-  i <- 3
-  while (i <= length(args)) {
-    switch(args[i],
-      "--genetic-map"    = { defaults$genetic_map_dir <- args[i+1]; i <- i+2 },
-      "--min-cm"         = { defaults$min_cm <- as.numeric(args[i+1]); i <- i+2 },
-      "--min-snps"       = { defaults$min_snps <- as.integer(args[i+1]); i <- i+2 },
-      "--mismatch-bunch" = { defaults$mismatch_bunch <- as.integer(args[i+1]); i <- i+2 },
-      "--seed-threshold" = { defaults$seed_threshold <- as.numeric(args[i+1]); i <- i+2 },
-      "--output"         = { defaults$output_file <- args[i+1]; i <- i+2 },
-      "--plot"           = { defaults$plot <- TRUE; i <- i+1 },
-      "--no-plot"        = { defaults$plot <- FALSE; i <- i+1 },
-      "--plot-file"      = { defaults$plot_file <- args[i+1]; i <- i+2 },
-      { cat("Unknown option:", args[i], "\n"); i <- i+1 }
-    )
+if (length(args) >= 1) {
+  # ---- Command-line mode: scan for --bfile first ----
+  bfile_idx <- match("--bfile", args)
+
+  if (!is.na(bfile_idx)) {
+    # PLINK mode
+    input_mode <- "plink"
+    plink_prefix <- args[bfile_idx + 1]
+    plink_sample1 <- NULL
+    plink_sample2 <- NULL
+
+    # Parse remaining flags (skip the positional --bfile value)
+    i <- 1
+    while (i <= length(args)) {
+      if (i == bfile_idx) { i <- i + 2; next }
+      switch(args[i],
+        "--sample1"        = { plink_sample1 <- args[i+1]; i <- i+2 },
+        "--sample2"        = { plink_sample2 <- args[i+1]; i <- i+2 },
+        "--genetic-map"    = { defaults$genetic_map_dir <- args[i+1]; i <- i+2 },
+        "--min-cm"         = { defaults$min_cm <- as.numeric(args[i+1]); i <- i+2 },
+        "--min-snps"       = { defaults$min_snps <- as.integer(args[i+1]); i <- i+2 },
+        "--mismatch-bunch" = { defaults$mismatch_bunch <- as.integer(args[i+1]); i <- i+2 },
+        "--seed-threshold" = { defaults$seed_threshold <- as.numeric(args[i+1]); i <- i+2 },
+        "--output"         = { defaults$output_file <- args[i+1]; i <- i+2 },
+        "--plot"           = { defaults$plot <- TRUE; i <- i+1 },
+        "--no-plot"        = { defaults$plot <- FALSE; i <- i+1 },
+        "--plot-file"      = { defaults$plot_file <- args[i+1]; i <- i+2 },
+        { cat("Unknown option:", args[i], "\n"); i <- i+1 }
+      )
+    }
+
+  } else if (length(args) >= 2 && !startsWith(args[1], "--")) {
+    # Raw file mode (two positional arguments)
+    input_mode <- "raw"
+    file1 <- args[1]
+    file2 <- args[2]
+    i <- 3
+    while (i <= length(args)) {
+      switch(args[i],
+        "--genetic-map"    = { defaults$genetic_map_dir <- args[i+1]; i <- i+2 },
+        "--min-cm"         = { defaults$min_cm <- as.numeric(args[i+1]); i <- i+2 },
+        "--min-snps"       = { defaults$min_snps <- as.integer(args[i+1]); i <- i+2 },
+        "--mismatch-bunch" = { defaults$mismatch_bunch <- as.integer(args[i+1]); i <- i+2 },
+        "--seed-threshold" = { defaults$seed_threshold <- as.numeric(args[i+1]); i <- i+2 },
+        "--output"         = { defaults$output_file <- args[i+1]; i <- i+2 },
+        "--plot"           = { defaults$plot <- TRUE; i <- i+1 },
+        "--no-plot"        = { defaults$plot <- FALSE; i <- i+1 },
+        "--plot-file"      = { defaults$plot_file <- args[i+1]; i <- i+2 },
+        { cat("Unknown option:", args[i], "\n"); i <- i+1 }
+      )
+    }
+  }
+}
+
+# ---- RStudio interactive mode fallback ----
+if (input_mode == "none") {
+  if (exists("bfile") && !is.null(get("bfile", envir = .GlobalEnv))) {
+    input_mode <- "plink"
+    plink_prefix <- get("bfile", envir = .GlobalEnv)
+    plink_sample1 <- if (exists("sample1")) get("sample1", envir = .GlobalEnv) else NULL
+    plink_sample2 <- if (exists("sample2")) get("sample2", envir = .GlobalEnv) else NULL
+  } else if (exists("file1") && exists("file2")) {
+    input_mode <- "raw"
+    file1 <- get("file1", envir = .GlobalEnv)
+    file2 <- get("file2", envir = .GlobalEnv)
   }
 
-} else if (exists("file1") && exists("file2")) {
-  # ---- RStudio interactive mode ----
-  if (exists("genetic_map_dir")) defaults$genetic_map_dir <- genetic_map_dir
-  if (exists("min_cm"))          defaults$min_cm          <- min_cm
-  if (exists("min_snps"))        defaults$min_snps        <- min_snps
-  if (exists("mismatch_bunch"))  defaults$mismatch_bunch  <- mismatch_bunch
-  if (exists("seed_threshold"))  defaults$seed_threshold  <- seed_threshold
-  if (exists("output_file"))     defaults$output_file     <- output_file
-  if (exists("plot_output"))     defaults$plot            <- plot_output
-  if (exists("plot_file"))       defaults$plot_file       <- plot_file
+  # Pick up shared options from global env
+  if (input_mode != "none") {
+    if (exists("genetic_map_dir")) defaults$genetic_map_dir <- genetic_map_dir
+    if (exists("min_cm"))          defaults$min_cm          <- min_cm
+    if (exists("min_snps"))        defaults$min_snps        <- min_snps
+    if (exists("mismatch_bunch"))  defaults$mismatch_bunch  <- mismatch_bunch
+    if (exists("seed_threshold"))  defaults$seed_threshold  <- seed_threshold
+    if (exists("output_file"))     defaults$output_file     <- output_file
+    if (exists("plot_output"))     defaults$plot            <- plot_output
+    if (exists("plot_file"))       defaults$plot_file       <- plot_file
+  }
+}
 
-} else {
+if (input_mode == "none") {
   message("
 ============================================================
 ChromoMatch
 ============================================================
 
-RStudio: Uncomment and set file1/file2 near the top of the
-         script, then select all and click Run.
+RStudio: Uncomment and set file1/file2 (or bfile) near the
+         top of the script, then select all and click Run.
 
-Command line:
+Command line (raw DNA files):
   Rscript chromomatch.R <file1> <file2> [options]
+
+Command line (PLINK dataset):
+  Rscript chromomatch.R --bfile <prefix> --sample1 ID1 --sample2 ID2
+  Rscript chromomatch.R --bfile <prefix>   (interactive sample picker)
 
 Options:
   --genetic-map DIR       Genetic map directory
@@ -130,14 +202,17 @@ Options:
   --output FILE           Output CSV (default: comparison_results.csv)
   --plot / --no-plot      Chromosome plot (default: yes)
   --plot-file FILE        Plot path (default: comparison_plot.png)
+  --bfile PREFIX          PLINK binary dataset (.bed/.bim/.fam)
+  --sample1 ID            First sample IID
+  --sample2 ID            Second sample IID
 
-Supported formats: 23andMe, AncestryDNA, FTDNA
+Supported raw formats: 23andMe, AncestryDNA, FTDNA
 ============================================================")
-  stop("Please set file1 and file2 before running.", call. = FALSE)
+  stop("Please provide input files before running.", call. = FALSE)
 }
 
 # =============================================================================
-# FILE FORMAT DETECTION AND PARSING
+# RAW DNA FILE FORMAT DETECTION AND PARSING
 # =============================================================================
 
 detect_and_read_raw <- function(filepath) {
@@ -227,7 +302,6 @@ detect_and_read_raw <- function(filepath) {
 
   cat("  Loaded", format(nrow(dt), big.mark = ","), "autosomal SNPs\n")
 
-  # Map internal format code to display name
   fmt_display <- switch(fmt,
     "23andme"  = "23andMe",
     "ancestry" = "AncestryDNA",
@@ -237,6 +311,277 @@ detect_and_read_raw <- function(filepath) {
 
   return(list(data = dt, format = fmt, format_display = fmt_display,
               build = build, snp_count = nrow(dt)))
+}
+
+# =============================================================================
+# PLINK BINARY (.bed/.bim/.fam) READER — pure R, no external tools
+# =============================================================================
+
+#' Read the .fam file and return a data.table of sample information
+read_plink_fam <- function(fam_path) {
+  fam <- fread(fam_path, header = FALSE, colClasses = rep("character", 6),
+               showProgress = FALSE)
+  setnames(fam, c("FID", "IID", "father", "mother", "sex", "pheno"))
+  return(fam)
+}
+
+#' Read the .bim file and return a data.table of variant information
+read_plink_bim <- function(bim_path) {
+  bim <- fread(bim_path, header = FALSE, showProgress = FALSE)
+  setnames(bim, c("chromosome", "rsid", "cM", "position", "allele1", "allele2"))
+  bim[, chromosome := as.character(chromosome)]
+  return(bim)
+}
+
+#' Resolve a sample identifier string against a .fam data.table.
+#' Accepts "FID IID" (compound), bare "IID" (if unique), or row number.
+#' Returns the 1-based row index into the fam table.
+resolve_sample_id <- function(id_string, fam, label = "sample") {
+  id_string <- trimws(id_string)
+
+  # 1. Try numeric row index
+  num <- suppressWarnings(as.integer(id_string))
+  if (!is.na(num) && num >= 1 && num <= nrow(fam)) return(num)
+
+  # 2. Try "FID IID" compound match (space-separated)
+  parts <- strsplit(id_string, "\\s+")[[1]]
+  if (length(parts) >= 2) {
+    fid <- parts[1]
+    iid <- paste(parts[-1], collapse = " ")  # IID may itself contain spaces
+    idx <- which(fam$FID == fid & fam$IID == iid)
+    if (length(idx) == 1) return(idx)
+    if (length(idx) > 1) {
+      cat("  WARNING: Multiple rows match FID='", fid, "' IID='", iid,
+          "' — using first\n", sep = "")
+      return(idx[1])
+    }
+    # If two-word input didn't match as FID+IID, fall through and try as bare IID
+  }
+
+  # 3. Try bare IID match
+  idx <- which(fam$IID == id_string)
+  if (length(idx) == 1) return(idx)
+  if (length(idx) > 1) {
+    cat("  ERROR: IID '", id_string, "' matches multiple samples:\n", sep = "")
+    for (j in idx) cat("    ", fam$FID[j], " ", fam$IID[j], "\n")
+    stop("Ambiguous ", label, ". Use 'FID IID' format, e.g. --", label,
+         " \"", fam$FID[idx[1]], " ", id_string, "\"", call. = FALSE)
+  }
+
+  # 4. Try case-insensitive partial match on "FID IID" display string
+  display <- paste(fam$FID, fam$IID)
+  idx <- grep(id_string, display, ignore.case = TRUE)
+  if (length(idx) == 1) return(idx)
+  if (length(idx) > 1) {
+    cat("  Multiple partial matches for '", id_string, "':\n", sep = "")
+    for (j in idx) cat("    ", fam$FID[j], " ", fam$IID[j], "\n")
+    stop("Ambiguous ", label, ". Please be more specific.", call. = FALSE)
+  }
+
+  stop(label, " not found in .fam: ", id_string, call. = FALSE)
+}
+
+#' Extract genotypes for exactly two samples from a PLINK .bed file.
+#' Returns a list with two data.tables in the same format as detect_and_read_raw().
+#'
+#' sample1_id and sample2_id can be "FID IID", bare "IID" (if unique), or
+#' row numbers. They are resolved via resolve_sample_id().
+#'
+#' BED format (variant-major, PLINK 1.9+):
+#'   - 3-byte magic header: 0x6C 0x1B 0x01
+#'   - Then for each variant: ceil(n_samples/4) bytes
+#'   - Each byte encodes 4 genotypes in 2-bit pairs (low bits first):
+#'       00 = homozygous allele1 (A1/A1)
+#'       01 = missing
+#'       10 = heterozygous (A1/A2)
+#'       11 = homozygous allele2 (A2/A2)
+read_plink_bed <- function(bfile_prefix, sample1_id, sample2_id) {
+  bed_path <- paste0(bfile_prefix, ".bed")
+  bim_path <- paste0(bfile_prefix, ".bim")
+  fam_path <- paste0(bfile_prefix, ".fam")
+
+  for (f in c(bed_path, bim_path, fam_path)) {
+    if (!file.exists(f)) stop("File not found: ", f, call. = FALSE)
+  }
+
+  # Read metadata
+  fam <- read_plink_fam(fam_path)
+  bim <- read_plink_bim(bim_path)
+
+  n_samples <- nrow(fam)
+  n_variants <- nrow(bim)
+  cat("  PLINK dataset:", format(n_variants, big.mark = ","), "variants,",
+      n_samples, "samples\n")
+
+  # Resolve sample identifiers to row indices
+  idx1 <- resolve_sample_id(sample1_id, fam, "sample1")
+  idx2 <- resolve_sample_id(sample2_id, fam, "sample2")
+  sample1_label <- paste(fam$FID[idx1], fam$IID[idx1])
+  sample2_label <- paste(fam$FID[idx2], fam$IID[idx2])
+  cat("  Sample 1: [", idx1, "] ", sample1_label, "\n", sep = "")
+  cat("  Sample 2: [", idx2, "] ", sample2_label, "\n", sep = "")
+
+  # Compute byte positions for these two samples within each variant block
+  bytes_per_variant <- as.integer(ceiling(n_samples / 4))
+
+  # For sample at 1-based index idx:
+  #   byte offset within variant block = floor((idx-1) / 4)
+  #   bit shift within that byte       = ((idx-1) %% 4) * 2
+  byte_offset1 <- as.integer(floor((idx1 - 1) / 4))
+  bit_shift1   <- as.integer(((idx1 - 1) %% 4) * 2)
+  byte_offset2 <- as.integer(floor((idx2 - 1) / 4))
+  bit_shift2   <- as.integer(((idx2 - 1) %% 4) * 2)
+
+  # Read entire BED file as raw bytes
+  cat("  Reading BED file...\n")
+  raw_bytes <- readBin(bed_path, what = "raw", n = file.info(bed_path)$size)
+
+  # Validate magic number
+  if (length(raw_bytes) < 3 ||
+      raw_bytes[1] != as.raw(0x6C) ||
+      raw_bytes[2] != as.raw(0x1B)) {
+    stop("Not a valid PLINK BED file (bad magic number)", call. = FALSE)
+  }
+  if (raw_bytes[3] != as.raw(0x01)) {
+    stop("Sample-major BED format not supported. ",
+         "Convert with: plink --bfile ... --make-bed --out ...", call. = FALSE)
+  }
+
+  # Extract genotype codes for both samples across all variants
+  # We work in integer arithmetic on the raw bytes
+  header_size <- 3L
+  geno1 <- integer(n_variants)
+  geno2 <- integer(n_variants)
+
+  # Vectorized extraction: compute the byte index for each variant
+  variant_offsets <- seq(0L, by = bytes_per_variant, length.out = n_variants)
+
+  # Byte indices (1-based) into raw_bytes for each sample at each variant
+  byte_idx1 <- header_size + variant_offsets + byte_offset1 + 1L
+  byte_idx2 <- header_size + variant_offsets + byte_offset2 + 1L
+
+  # Extract and decode the 2-bit genotype codes
+  geno1 <- bitwAnd(bitwShiftR(as.integer(raw_bytes[byte_idx1]), bit_shift1), 3L)
+  geno2 <- bitwAnd(bitwShiftR(as.integer(raw_bytes[byte_idx2]), bit_shift2), 3L)
+
+  # Decode: 0 = A1/A1, 1 = missing, 2 = het (A1/A2), 3 = A2/A2
+  # Build genotype strings from allele1/allele2 in bim
+  a1 <- bim$allele1  # "clear bits" allele
+  a2 <- bim$allele2  # "set bits" allele
+
+  genotype1 <- ifelse(geno1 == 0L, paste0(a1, a1),
+               ifelse(geno1 == 2L, paste0(a1, a2),
+               ifelse(geno1 == 3L, paste0(a2, a2), NA_character_)))
+  genotype2 <- ifelse(geno2 == 0L, paste0(a1, a1),
+               ifelse(geno2 == 2L, paste0(a1, a2),
+               ifelse(geno2 == 3L, paste0(a2, a2), NA_character_)))
+
+  # Build data.tables in the same format as raw DNA files
+  dt1 <- data.table(
+    rsid       = bim$rsid,
+    chromosome = bim$chromosome,
+    position   = bim$position,
+    genotype   = genotype1
+  )
+  dt2 <- data.table(
+    rsid       = bim$rsid,
+    chromosome = bim$chromosome,
+    position   = bim$position,
+    genotype   = genotype2
+  )
+
+  # Standardize (same filtering as raw DNA path)
+  standardize_plink_dt <- function(dt, label) {
+    dt[, chromosome := toupper(gsub("chr", "", chromosome, ignore.case = TRUE))]
+    dt[, position := as.integer(position)]
+    dt <- dt[chromosome %in% as.character(1:22)]
+    dt[, chromosome := as.integer(chromosome)]
+    dt <- dt[!is.na(genotype) & genotype != "00" & nchar(genotype) == 2 &
+             !is.na(position)]
+    setkey(dt, chromosome, position)
+    cat("  ", label, ":", format(nrow(dt), big.mark = ","), "autosomal SNPs\n")
+    return(dt)
+  }
+
+  dt1 <- standardize_plink_dt(dt1, sample1_label)
+  dt2 <- standardize_plink_dt(dt2, sample2_label)
+
+  return(list(
+    dt1 = list(data = dt1, format = "plink", format_display = "PLINK",
+               build = "37", snp_count = nrow(dt1)),
+    dt2 = list(data = dt2, format = "plink", format_display = "PLINK",
+               build = "37", snp_count = nrow(dt2)),
+    sample1_label = sample1_label,
+    sample2_label = sample2_label,
+    fam = fam
+  ))
+}
+
+#' Interactive sample picker — presents a searchable/numbered list
+#' Shows "FID IID" for each sample. User can select by number, exact
+#' "FID IID", exact "IID" (if unique), or partial text match.
+interactive_sample_selection <- function(fam) {
+  display_ids <- paste(fam$FID, fam$IID)
+  n <- length(display_ids)
+
+  cat("\n============================================================\n")
+  cat("PLINK Dataset — Sample Selection\n")
+  cat("============================================================\n")
+  cat("  ", n, "samples available:\n\n")
+
+  # Display as a numbered list (FID + IID)
+  col_width <- max(nchar(display_ids)) + 7  # room for index + padding
+  cols <- max(1, floor(72 / col_width))
+  for (i in seq_along(display_ids)) {
+    entry <- sprintf("  %3d) %-*s", i, col_width - 7, display_ids[i])
+    cat(entry)
+    if (i %% cols == 0 || i == n) cat("\n")
+  }
+
+  cat("\n")
+
+  pick_sample <- function(prompt) {
+    repeat {
+      cat(prompt)
+      input <- trimws(readline())
+
+      # Try numeric index
+      num <- suppressWarnings(as.integer(input))
+      if (!is.na(num) && num >= 1 && num <= n)
+        return(display_ids[num])
+
+      # Try exact "FID IID" match
+      match_idx <- which(display_ids == input)
+      if (length(match_idx) == 1) return(display_ids[match_idx])
+
+      # Try bare IID match (if unique)
+      iid_idx <- which(fam$IID == input)
+      if (length(iid_idx) == 1) return(display_ids[iid_idx])
+
+      # Try case-insensitive partial match
+      match_idx <- grep(input, display_ids, ignore.case = TRUE)
+      if (length(match_idx) == 1) return(display_ids[match_idx])
+      if (length(match_idx) > 1) {
+        cat("  Multiple matches:\n")
+        for (j in match_idx)
+          cat("    ", j, ") ", display_ids[j], "\n", sep = "")
+        cat("  Please be more specific or enter a number.\n")
+        next
+      }
+
+      cat("  Not found. Enter a number (1-", n,
+          "), 'FID IID', or a search term.\n", sep = "")
+    }
+  }
+
+  s1 <- pick_sample("  Select sample 1 (number, name, or search): ")
+  cat("  -> ", s1, "\n")
+  s2 <- pick_sample("  Select sample 2 (number, name, or search): ")
+  cat("  -> ", s2, "\n")
+
+  if (s1 == s2) stop("Sample 1 and Sample 2 must be different.", call. = FALSE)
+  cat("\n")
+  return(list(sample1 = s1, sample2 = s2))
 }
 
 # =============================================================================
@@ -520,7 +865,7 @@ detect_segments_on_chr <- function(matches, positions, cm_positions, n_snps,
 }
 
 # =============================================================================
-# CHROMOSOME VISUALIZATION
+# CHROMOSOME VISUALIZATION — Modern Dark Theme
 # =============================================================================
 
 plot_chromosome_comparison <- function(result, plot_file, file_info = NULL) {
@@ -536,63 +881,148 @@ plot_chromosome_comparison <- function(result, plot_file, file_info = NULL) {
   names(chr_lengths) <- 1:22
   max_len <- max(chr_lengths); n_chr <- 22
 
-  png(plot_file, width = 1400, height = 800, res = 100)
-  par(mar = c(4, 4, 4, 18), xpd = FALSE)
+  # --- Color palette ---
+  bg_color      <- "#1a1a2e"    # deep navy background
+  panel_color   <- "#16213e"    # slightly lighter panel
+  chr_fill      <- "#2a2a4a"    # chromosome bar fill
+  chr_border    <- "#3a3a5c"    # chromosome bar border
+  seg_fill      <- "#00d4aa"    # teal/mint for segments
+  seg_border    <- "#00b894"    # slightly darker teal border
+  seg_glow      <- "#00d4aa40"  # translucent glow behind segments
+  text_primary  <- "#e8e8f0"    # bright text
+  text_secondary <- "#8888aa"   # dimmer text
+  accent        <- "#6c5ce7"    # purple accent
+  grid_color    <- "#2a2a4a"    # subtle grid lines
+
+  png(plot_file, width = 1600, height = 900, res = 110, bg = bg_color)
+
+  par(mar = c(4.5, 4.5, 4, 19), xpd = FALSE, bg = bg_color,
+      fg = text_primary, col.axis = text_secondary, col.lab = text_secondary,
+      col.main = text_primary, family = "sans")
 
   plot(NULL, xlim = c(0, max_len), ylim = c(0.5, n_chr + 0.5),
-       xlab = "Position (bp)", ylab = "", yaxt = "n",
-       main = "ChromoMatch - Shared Segments", cex.main = 1.3,
-       xaxt = "n")  # suppress default x-axis
-  axis(1, at = axTicks(1),
-       labels = scales::label_number(scale = 1e-6, suffix = "M")(axTicks(1)))
-  axis(2, at = 1:n_chr, labels = rev(1:n_chr), las = 2, cex.axis = 0.9)
-  mtext("Chromosome", side = 2, line = 2.5)
+       xlab = "", ylab = "", yaxt = "n", xaxt = "n",
+       main = "", bty = "n")
 
+  # Title with accent line
+  mtext("ChromoMatch", side = 3, line = 2.2, cex = 1.6, font = 2,
+        col = text_primary, adj = 0)
+  mtext("Shared IBD Segments", side = 3, line = 0.8, cex = 1.0,
+        col = text_secondary, adj = 0)
+
+  # Subtle horizontal grid lines
   for (i in 1:n_chr) {
     y <- n_chr - i + 1
-    rect(0, y - 0.3, chr_lengths[i], y + 0.3, col = "gray90", border = "gray70")
+    abline(h = y, col = grid_color, lwd = 0.5)
   }
+
+  # X-axis
+  tick_at <- axTicks(1)
+  axis(1, at = tick_at,
+       labels = paste0(round(tick_at / 1e6), "M"),
+       col = grid_color, col.ticks = text_secondary,
+       cex.axis = 0.8, lwd = 0.5)
+  mtext("Position (bp)", side = 1, line = 2.8, cex = 0.9, col = text_secondary)
+
+  # Y-axis
+  axis(2, at = 1:n_chr, labels = rev(1:n_chr), las = 2,
+       col = grid_color, col.ticks = text_secondary,
+       cex.axis = 0.85, lwd = 0.5)
+  mtext("Chromosome", side = 2, line = 2.8, cex = 0.9, col = text_secondary)
+
+  # Draw chromosome bars with rounded appearance
+  for (i in 1:n_chr) {
+    y <- n_chr - i + 1
+    rect(0, y - 0.28, chr_lengths[i], y + 0.28,
+         col = chr_fill, border = chr_border, lwd = 0.8)
+  }
+
+  # Draw segments: glow layer first, then solid
   for (i in 1:nrow(segs)) {
     y <- n_chr - segs$Chr[i] + 1
-    rect(segs$Start_Position[i], y - 0.3, segs$End_Position[i], y + 0.3,
-         col = "#E066FF", border = "#CC44DD")
+    # Glow
+    rect(segs$Start_Position[i] - max_len * 0.002, y - 0.38,
+         segs$End_Position[i] + max_len * 0.002, y + 0.38,
+         col = seg_glow, border = NA)
+    # Solid segment
+    rect(segs$Start_Position[i], y - 0.28,
+         segs$End_Position[i], y + 0.28,
+         col = seg_fill, border = seg_border, lwd = 0.8)
   }
 
+  # ---- Right-side summary panel ----
   par(xpd = TRUE)
-  x <- max_len * 1.05; yt <- n_chr
-  text(x, yt,   paste("Total cMs:", round(sum(segs$cM), 2)), adj = 0, cex = 1, font = 2)
-  text(x, yt-1, paste("SNPs Overlapping:", format(result$total_overlapping, big.mark = ",")),
-       adj = 0, cex = 1)
-  text(x, yt-2, paste("Segments:", nrow(segs)), adj = 0, cex = 1)
+  x <- max_len * 1.05
+  yt <- n_chr
 
-  # File information
-  if (!is.null(file_info)) {
-    text(x, yt-3.3, paste0(file_info$name1),
-         adj = 0, cex = 0.65, family = "mono")
-    text(x, yt-4.0, paste0("  ", format(file_info$snps1, big.mark = ","),
-                            " SNPs (", file_info$fmt1, ")"),
-         adj = 0, cex = 0.65, family = "mono")
-    text(x, yt-5.0, paste0(file_info$name2),
-         adj = 0, cex = 0.65, family = "mono")
-    text(x, yt-5.7, paste0("  ", format(file_info$snps2, big.mark = ","),
-                            " SNPs (", file_info$fmt2, ")"),
-         adj = 0, cex = 0.65, family = "mono")
+  # Summary stats
+  text(x, yt, paste("Total cM:", round(sum(segs$cM), 2)),
+       adj = 0, cex = 1.1, font = 2, col = seg_fill)
+  text(x, yt - 1, paste("Overlapping SNPs:",
+       format(result$total_overlapping, big.mark = ",")),
+       adj = 0, cex = 0.9, col = text_primary)
+  text(x, yt - 2, paste("Segments:", nrow(segs)),
+       adj = 0, cex = 0.9, col = text_primary)
+
+  # Estimated relationship
+  y_after_stats <- yt - 2
+  if (!is.null(file_info) && !is.null(file_info$relationship)) {
+    y_after_stats <- yt - 3.2
+    text(x, yt - 3.2, file_info$relationship,
+         adj = 0, cex = 0.8, font = 3, col = "#f8b500")
   }
 
-  y_tbl <- yt - 7.0
-  text(x, y_tbl, sprintf("%-4s %12s %12s %6s %6s", "Chr", "Start", "End", "cM", "SNPs"),
-       adj = 0, cex = 0.7, family = "mono")
-  for (i in 1:min(nrow(segs), 15)) {
-    text(x, y_tbl - i * 0.7,
+  # Accent divider
+  segments(x, y_after_stats - 0.7, x + max_len * 0.18, y_after_stats - 0.7,
+           col = accent, lwd = 2)
+
+  # Dataset name (for PLINK mode)
+  y_cursor <- y_after_stats - 1.0
+  if (!is.null(file_info) && !is.null(file_info$dataset_name)) {
+    text(x, y_cursor, paste("Dataset:", file_info$dataset_name),
+         adj = 0, cex = 0.7, family = "mono", col = text_secondary)
+    y_cursor <- y_cursor - 0.7
+  }
+
+  # File/sample information
+  if (!is.null(file_info)) {
+    y_cursor <- y_cursor - 0.1
+    text(x, y_cursor, file_info$name1,
+         adj = 0, cex = 0.65, family = "mono", col = seg_fill)
+    text(x, y_cursor - 0.6, paste0("  ", format(file_info$snps1, big.mark = ","),
+                              " SNPs (", file_info$fmt1, ")"),
+         adj = 0, cex = 0.6, family = "mono", col = text_secondary)
+    y_cursor <- y_cursor - 1.4
+    text(x, y_cursor, file_info$name2,
+         adj = 0, cex = 0.65, family = "mono", col = seg_fill)
+    text(x, y_cursor - 0.6, paste0("  ", format(file_info$snps2, big.mark = ","),
+                              " SNPs (", file_info$fmt2, ")"),
+         adj = 0, cex = 0.6, family = "mono", col = text_secondary)
+    y_cursor <- y_cursor - 1.4
+  }
+
+  # Segment table
+  y_tbl <- y_cursor - 0.4
+  segments(x, y_tbl + 0.3, x + max_len * 0.18, y_tbl + 0.3,
+           col = accent, lwd = 1)
+  text(x, y_tbl,
+       sprintf("%-4s %12s %12s %6s %6s", "Chr", "Start", "End", "cM", "SNPs"),
+       adj = 0, cex = 0.65, family = "mono", col = text_secondary)
+
+  max_rows <- min(nrow(segs), 14)
+  for (i in 1:max_rows) {
+    row_col <- if (i %% 2 == 0) text_secondary else text_primary
+    text(x, y_tbl - i * 0.68,
          sprintf("%-4d %12s %12s %6.2f %6s", segs$Chr[i],
                  format(segs$Start_Position[i], big.mark = ","),
                  format(segs$End_Position[i], big.mark = ","),
                  segs$cM[i], format(segs$SNPs[i], big.mark = ",")),
-         adj = 0, cex = 0.65, family = "mono")
+         adj = 0, cex = 0.6, family = "mono", col = row_col)
   }
-  if (nrow(segs) > 15)
-    text(x, y_tbl - 16 * 0.7, paste("... and", nrow(segs) - 15, "more"),
-         adj = 0, cex = 0.7, font = 3)
+  if (nrow(segs) > max_rows)
+    text(x, y_tbl - (max_rows + 1) * 0.68,
+         paste("... +", nrow(segs) - max_rows, "more"),
+         adj = 0, cex = 0.65, font = 3, col = text_secondary)
 
   dev.off()
   cat("  Plot saved to:", plot_file, "\n")
@@ -602,7 +1032,7 @@ plot_chromosome_comparison <- function(result, plot_file, file_info = NULL) {
 # RELATIONSHIP ESTIMATION (Blaine Bettinger's Shared cM Project ranges)
 # =============================================================================
 
-estimate_relationship <- function(total_cm) {
+estimate_relationship <- function(total_cm, silent = FALSE) {
   rel <- if (total_cm > 3400) "Parent/Child or Identical Twin (~3400 cM)"
     else if (total_cm > 2300) "Full Sibling (~2550 cM)"
     else if (total_cm > 1700) "Grandparent, Aunt/Uncle, Half-Sibling (~1750 cM)"
@@ -612,7 +1042,8 @@ estimate_relationship <- function(total_cm) {
     else if (total_cm > 90)   "3rd Cousin (~100 cM)"
     else if (total_cm > 20)   "4th-6th Cousin"
     else                      "Very distant or no detectable relationship"
-  cat("  Estimated relationship:", rel, "\n")
+  if (!silent) cat("  Estimated relationship:", rel, "\n")
+  return(invisible(rel))
 }
 
 # =============================================================================
@@ -650,19 +1081,58 @@ main <- function() {
   cat("============================================================\n")
   cat("ChromoMatch\n")
   cat("============================================================\n")
-  cat("  File 1:", file1, "\n")
-  cat("  File 2:", file2, "\n")
-  cat("  Min cM:", defaults$min_cm, "| Min SNPs:", defaults$min_snps, "\n")
-  cat("  Window:", defaults$mismatch_bunch,
-      "| Seed threshold:", defaults$seed_threshold, "\n")
-  cat("------------------------------------------------------------\n")
 
-  cat("\nReading files...\n")
-  raw1 <- detect_and_read_raw(file1)
-  raw2 <- detect_and_read_raw(file2)
+  if (input_mode == "plink") {
+    # ------ PLINK binary input ------
+    cat("  Mode:  PLINK binary dataset\n")
+    cat("  Bfile:", plink_prefix, "\n")
 
-  if (raw1$build != raw2$build)
-    cat("\n  WARNING: Different builds (", raw1$build, "vs", raw2$build, ")\n")
+    # Resolve sample IDs (interactive if not provided)
+    s1 <- plink_sample1
+    s2 <- plink_sample2
+    if (is.null(s1) || is.null(s2)) {
+      fam <- read_plink_fam(paste0(plink_prefix, ".fam"))
+      picks <- interactive_sample_selection(fam)
+      s1 <- picks$sample1
+      s2 <- picks$sample2
+    }
+
+    cat("  Sample 1:", s1, "\n")
+    cat("  Sample 2:", s2, "\n")
+    cat("  Min cM:", defaults$min_cm, "| Min SNPs:", defaults$min_snps, "\n")
+    cat("  Window:", defaults$mismatch_bunch,
+        "| Seed threshold:", defaults$seed_threshold, "\n")
+    cat("------------------------------------------------------------\n")
+
+    cat("\nReading PLINK dataset...\n")
+    plink_data <- read_plink_bed(plink_prefix, s1, s2)
+    raw1 <- plink_data$dt1
+    raw2 <- plink_data$dt2
+
+    # Labels for plot (resolved FID+IID from the fam file)
+    label1 <- plink_data$sample1_label
+    label2 <- plink_data$sample2_label
+
+  } else {
+    # ------ Raw DNA file input ------
+    cat("  Mode:  Raw DNA files\n")
+    cat("  File 1:", file1, "\n")
+    cat("  File 2:", file2, "\n")
+    cat("  Min cM:", defaults$min_cm, "| Min SNPs:", defaults$min_snps, "\n")
+    cat("  Window:", defaults$mismatch_bunch,
+        "| Seed threshold:", defaults$seed_threshold, "\n")
+    cat("------------------------------------------------------------\n")
+
+    cat("\nReading files...\n")
+    raw1 <- detect_and_read_raw(file1)
+    raw2 <- detect_and_read_raw(file2)
+
+    if (raw1$build != raw2$build)
+      cat("\n  WARNING: Different builds (", raw1$build, "vs", raw2$build, ")\n")
+
+    label1 <- basename(file1)
+    label2 <- basename(file2)
+  }
 
   cat("\nLoading genetic map...\n")
   genetic_map <- load_genetic_map(defaults$genetic_map_dir)
@@ -680,13 +1150,16 @@ main <- function() {
     cat("\n  Results saved to:", defaults$output_file, "\n")
     if (defaults$plot) {
       cat("  Generating plot...\n")
+      rel_str <- estimate_relationship(sum(result$segments$cM), silent = TRUE)
       file_info <- list(
-        name1 = basename(file1),
+        name1 = label1,
         snps1 = raw1$snp_count,
         fmt1  = raw1$format_display,
-        name2 = basename(file2),
+        name2 = label2,
         snps2 = raw2$snp_count,
-        fmt2  = raw2$format_display
+        fmt2  = raw2$format_display,
+        dataset_name = if (input_mode == "plink") basename(plink_prefix) else NULL,
+        relationship = rel_str
       )
       plot_chromosome_comparison(result, defaults$plot_file, file_info)
     }

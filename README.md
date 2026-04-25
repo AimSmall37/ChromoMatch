@@ -1,20 +1,23 @@
 # ChromoMatch
 
-An R script that compares two autosomal raw DNA files from consumer genetic testing services and identifies shared IBD (identical-by-descent) segments in centimorgans (cM). Useful for genetic genealogy research to determine biological relationships between two individuals.
+An R script that compares two autosomal DNA samples and identifies shared IBD (identical-by-descent) segments in centimorgans (cM). Supports both raw DNA files from consumer genetic testing services and PLINK binary datasets, making it useful for genetic genealogy research as well as population-level studies with large multi-sample genotype collections.
 
 ## Features
 
 - **Multi-format support** — Automatically detects and parses raw DNA files from 23andMe, AncestryDNA, and Family Tree DNA (FTDNA)
+- **PLINK binary support** — Reads `.bed/.bim/.fam` datasets directly in pure R with no external tools required. Extracts only the two requested samples using vectorized bit-level decoding, efficiently handling datasets with thousands of samples and millions of variants.
+- **Interactive sample picker** — When using PLINK datasets, presents a searchable numbered list of all samples. Select by row number, exact `FID IID`, bare `IID` (if unique), or partial text match.
+- **Flexible sample identification** — Samples can be specified as `"FID IID"` (compound), bare `IID` (if unambiguous), or row number. Ambiguous IIDs produce a clear error listing the duplicates with instructions to use the full `FID IID` format.
 - **Genetic map integration** — Uses PLINK or HapMap recombination maps for accurate bp-to-cM conversion; auto-downloads the Beagle GRCh37 map if none is provided
 - **Seed-and-extend IBD detection** — Sliding-window algorithm that distinguishes true shared segments from background noise (~93% of SNPs match between any two humans by chance)
-- **Chromosome visualization** — Generates a PNG plot showing all 22 autosomes with shared segments highlighted, plus a summary table
+- **Chromosome visualization** — Generates a dark-themed PNG plot showing all 22 autosomes with shared segments highlighted, including summary statistics, dataset name, relationship estimate, and a segment detail table
 - **Relationship estimation** — Estimates probable relationship based on total shared cM using Blaine Bettinger's Shared cM Project ranges
 - **Dual execution modes** — Run from the command line with arguments or interactively in RStudio
 - **Single dependency** — Requires only the `data.table` package (auto-installed if missing)
 
 ## Quick Start
 
-### Command Line
+### Raw DNA Files (Command Line)
 
 ```bash
 Rscript chromomatch.R person1_23andme.txt person2_ancestry.txt \
@@ -22,19 +25,39 @@ Rscript chromomatch.R person1_23andme.txt person2_ancestry.txt \
   --output results.csv
 ```
 
+### PLINK Dataset (Command Line)
+
+```bash
+# Specify both samples directly
+Rscript chromomatch.R --bfile my_dataset --sample1 "Small Aim" --sample2 "Small SecondCousin"
+
+# Or use the interactive sample picker
+Rscript chromomatch.R --bfile my_dataset
+```
+
 ### RStudio Interactive
 
-Open `chromomatch.R`, uncomment and edit the configuration section near the top:
+Open `chromomatch.R`, uncomment and edit the configuration section near the top. Use **either** raw files or a PLINK dataset:
 
 ```r
+# --- Raw DNA files ---
 file1           <- "C:/path/to/person1.txt"
 file2           <- "C:/path/to/person2.csv"
+
+# --- OR: PLINK dataset ---
+bfile           <- "C:/path/to/plink_dataset"   # prefix for .bed/.bim/.fam
+sample1         <- "Small Aim"                  # "FID IID", or bare IID if unique
+sample2         <- "Small SecondCousin"         # leave unset for interactive picker
+
+# --- Shared options ---
 genetic_map_dir <- "./genetic_map_grch37"
 ```
 
 Then select all and click **Run**.
 
-## Supported File Formats
+## Supported Input Formats
+
+### Raw DNA Files
 
 | Service | Format | Separator | Columns |
 |---------|--------|-----------|---------|
@@ -43,6 +66,33 @@ Then select all and click **Run**.
 | **FTDNA** | CSV with quoted fields, 1-line header | Comma | RSID, CHROMOSOME, POSITION, RESULT |
 
 The format is auto-detected from file headers and structure. All files are assumed to use GRCh37/hg19 coordinates unless the header indicates GRCh38.
+
+### PLINK Binary Datasets
+
+ChromoMatch reads PLINK binary files (`.bed`, `.bim`, `.fam`) natively in pure R — no external `plink` executable is required. The BED reader uses vectorized bit-level decoding to extract genotypes for exactly two samples without loading the entire genotype matrix into memory.
+
+The three files must share a common prefix:
+
+| File | Contents |
+|------|----------|
+| `prefix.bed` | Binary genotype data (variant-major format) |
+| `prefix.bim` | Variant information: chromosome, rsid, cM, position, allele1, allele2 |
+| `prefix.fam` | Sample information: FID, IID, father, mother, sex, phenotype |
+
+#### Sample Identification
+
+Samples are identified using the `.fam` file. The `--sample1` and `--sample2` arguments accept any of the following formats, resolved in this order:
+
+1. **Row number** — `--sample1 21` selects the 21st sample in the `.fam` file
+2. **"FID IID" compound** — `--sample1 "Small Aim"` matches FID=`Logan`, IID=`Patrick` exactly
+3. **Bare IID** — `--sample1 Patrick` works if `Patrick` is unique across all IIDs. If the IID is ambiguous (e.g., `Deborah` appears in multiple families), the script errors with a clear message listing the duplicates and suggesting the `"FID IID"` format.
+4. **Partial text match** — `--sample1 "Piper"` matches if only one sample contains that text
+
+#### Interactive Sample Picker
+
+When `--sample1` and `--sample2` are omitted, the script presents an interactive numbered list of all samples showing `FID IID`. You can select by typing a number, a name, or a search term:
+
+![Interactive sample selection showing a searchable list of PLINK dataset samples](images/sample_selection.png)
 
 ## Genetic Map
 
@@ -62,9 +112,11 @@ The column layout is auto-detected by inspecting the data types in each column.
 | File | Description |
 |------|-------------|
 | `comparison_results.csv` | CSV with columns: Chr, Start_Position, End_Position, cM, SNPs |
-| `comparison_plot.png` | Chromosome visualization with shared segments and summary stats |
+| `comparison_plot.png` | Chromosome visualization with shared segments and summary statistics |
 
-![Example Comparison Plot image showing matching segments and centimorgans](images/comparison_plot.png)
+The chromosome visualization uses a modern dark theme with teal segment highlights. The right-side panel includes total shared cM, overlapping SNPs, segment count, estimated relationship, dataset name (for PLINK inputs), sample names with SNP counts, and a detail table of individual segments.
+
+![Example comparison plot showing shared IBD segments across 22 chromosomes](images/comparison_plot.png)
 
 ## How the Algorithm Works
 
@@ -86,6 +138,22 @@ The algorithm uses a **seed-and-extend** approach to distinguish true IBD from b
    - At least 30% of sliding windows within the segment must be seed-quality
 
 6. **Filter** — Segments below `min_cm` or `min_snps` are discarded.
+
+## Command-Line Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--bfile <prefix>` | — | PLINK binary dataset prefix (looks for `prefix.bed`, `prefix.bim`, `prefix.fam`) |
+| `--sample1 <ID>` | — | First sample: row number, `"FID IID"`, or bare IID |
+| `--sample2 <ID>` | — | Second sample: row number, `"FID IID"`, or bare IID |
+| `--genetic-map <dir>` | auto-download | Directory containing per-chromosome genetic map files |
+| `--min-cm <num>` | 7 | Minimum segment size in cM to report |
+| `--min-snps <num>` | 500 | Minimum SNPs per segment |
+| `--mismatch-bunch <num>` | 250 | Sliding window size in SNPs |
+| `--seed-threshold <num>` | 0.02 | Max mismatch rate to seed an IBD region |
+| `--output <path>` | `comparison_results.csv` | Output CSV path |
+| `--plot` / `--no-plot` | `--plot` | Generate chromosome plot |
+| `--plot-file <path>` | `comparison_plot.png` | Plot file path |
 
 ## Tunable Parameters
 
@@ -136,7 +204,7 @@ The script was validated by comparing results for a known 1st-cousin-twice-remov
 
 ### Discussion
 
-All three tools identified the same 10 core IBD segments on the same chromosomes. The ChromoMatch found one additional borderline segment on chromosome 5 (8.06 cM) that was below the detection threshold of the other two tools.
+All three tools identified the same 10 core IBD segments on the same chromosomes. ChromoMatch found one additional borderline segment on chromosome 5 (8.06 cM) that was below the detection threshold of the other two tools.
 
 The ~17–25 cM total difference is consistent with known sources of inter-tool variation:
 
@@ -154,7 +222,7 @@ This level of variation (~10%) is normal and expected. Commercial DNA testing se
 
 - **R** ≥ 3.5
 - **data.table** package (auto-installed if missing)
-- Raw DNA files from 23andMe, AncestryDNA, or FTDNA
+- Raw DNA files from 23andMe, AncestryDNA, or FTDNA — and/or a PLINK binary dataset (`.bed/.bim/.fam`)
 - A genetic recombination map (auto-downloaded if not provided)
 
 ## License
