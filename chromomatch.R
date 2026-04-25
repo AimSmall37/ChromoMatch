@@ -26,7 +26,7 @@
 #   --plot / --no-plot     Generate chromosome plot (default: yes)
 #   --plot-file <path>     Plot file path (default: comparison_plot.png)
 #
-# License: MIT
+# License: AGPL-3.0 license
 ###############################################################################
 
 # =============================================================================
